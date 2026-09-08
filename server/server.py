@@ -22,6 +22,7 @@ and approval events. Falls back to direct Anthropic ("basic mode") if unreachabl
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import base64
 import inspect
 import io
@@ -64,11 +65,103 @@ except ImportError:  # machines panel degrades gracefully
     psutil = None
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _load_env_files() -> None:
+    """Loads ~/.hermes/.env and server/.env into os.environ if not present."""
+    for p in [Path.home() / ".hermes" / ".env", ROOT / ".env"]:
+        if not p.is_file():
+            continue
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip("'\"")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+        except Exception:
+            pass
+
+
+_load_env_files()
+
 CONFIG_PATH = ROOT / "config" / "server.yaml"
 LOG_PATH = ROOT / "logs" / "latency.jsonl"
 STATE_PATH = ROOT / "logs" / "hermes_sessions.json"
 USAGE_PATH = ROOT / "logs" / "usage_stats.json"
 _USAGE_LOCK = threading.Lock()
+
+
+def _call_fast_llm(prompt: str, max_tokens: int = 300, temperature: float = 0.1) -> str:
+    """Ultra-low latency LLM helper for intent extraction / classification.
+    Tier 1: Groq qwen/qwen3.8-27b (~0.3-0.5s)
+    Tier 2: Gemini 2.5 Flash (~0.8-1.2s)
+    Tier 3: Local llama-server (127.0.0.1:8081) with 6s timeout (offline fallback only)
+    """
+    for k in [os.environ.get("GROQ_API_KEY"), os.environ.get("GROQ_API_KEY_2"), os.environ.get("GROQ_API_KEY_3")]:
+        if not k:
+            continue
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {k}"},
+                json={
+                    "model": "qwen/qwen3.8-27b",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+                timeout=4,
+            )
+            if resp.ok:
+                c = resp.json()["choices"][0]["message"]["content"].strip()
+                if c:
+                    return c
+        except Exception:
+            pass
+
+    gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if gemini_key:
+        try:
+            resp = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                headers={"Authorization": f"Bearer {gemini_key}"},
+                json={
+                    "model": "gemini-2.5-flash",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+                timeout=4,
+            )
+            if resp.ok:
+                c = resp.json()["choices"][0]["message"]["content"].strip()
+                if c:
+                    return c
+        except Exception:
+            pass
+
+    try:
+        resp = requests.post(
+            "http://127.0.0.1:8081/v1/chat/completions",
+            json={
+                "model": "gpt-oss:20b",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": min(max_tokens, 150),
+                "temperature": temperature,
+                "reasoning_effort": "low",
+            },
+            timeout=6,
+        )
+        if resp.ok:
+            return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        pass
+
+    return ""
+
 
 
 def _today() -> str:
@@ -1200,18 +1293,7 @@ class VoicePipelineServer:
             f"Mensaje: \"{text}\""
         )
         try:
-            resp = requests.post(
-                "http://127.0.0.1:8081/v1/chat/completions",
-                json={
-                    "model": "gpt-oss:20b",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 500,
-                    "temperature": 0.2,
-                },
-                timeout=40,
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
+            content = _call_fast_llm(prompt, max_tokens=150, temperature=0.1)
             content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.M).strip()
             data = json.loads(content)
             name = self._wa_norm_alias(data.get("nombre") or "") or None
@@ -1219,6 +1301,7 @@ class VoicePipelineServer:
             return name, msg
         except Exception:
             return None, None
+
 
     @staticmethod
     def _wa_is_confirm(text: str) -> bool:
@@ -1514,21 +1597,8 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
             "indice|CATEGORIA|razon en máximo 12 palabras en español\n"
             "Para OFERTA, la razón debe decir si encaja o no con el perfil y por qué, en pocas palabras."
         )
-        try:
-            resp = requests.post(
-                "http://127.0.0.1:8081/v1/chat/completions",
-                json={
-                    "model": "gpt-oss:20b",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 900,
-                    "temperature": 0.1,
-                    "reasoning_effort": "low",
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            out = resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception:
+        out = _call_fast_llm(prompt, max_tokens=350, temperature=0.1)
+        if not out:
             return []
         results: list[dict] = []
         for line in out.splitlines():
@@ -1551,7 +1621,7 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages",
                 params={"q": "is:unread", "maxResults": 10},
                 headers=headers,
-                timeout=20,
+                timeout=10,
             )
         except Exception:
             return "Gmail no respondió. Red o API caída."
@@ -1564,28 +1634,37 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
         rows = payload.get("messages") or []
         if not rows:
             return "Bandeja revisada: no hay correos sin leer."
-        emails: list[dict] = []
-        for row in rows[:10]:
+
+        def _fetch_msg(row: dict) -> dict | None:
             mid = row.get("id")
             if not mid:
-                continue
-            got = requests.get(
-                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}",
-                params={"format": "metadata", "metadataHeaders": ["From", "Subject"]},
-                headers=headers,
-                timeout=20,
-            )
-            if not got.ok:
-                continue
-            body = got.json()
-            hdrs = {
-                str(h.get("name") or "").lower(): str(h.get("value") or "")
-                for h in ((body.get("payload") or {}).get("headers") or [])
-            }
-            sender = hdrs.get("from") or "desconocido"
-            sender = re.sub(r"\s*<[^>]+>", "", sender).strip().strip('"') or sender
-            subj = (hdrs.get("subject") or "(sin asunto)").strip()
-            emails.append({"mid": mid, "sender": sender, "subject": subj, "snippet": body.get("snippet") or ""})
+                return None
+            try:
+                got = requests.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}",
+                    params={"format": "metadata", "metadataHeaders": ["From", "Subject"]},
+                    headers=headers,
+                    timeout=8,
+                )
+                if not got.ok:
+                    return None
+                body = got.json()
+                hdrs = {
+                    str(h.get("name") or "").lower(): str(h.get("value") or "")
+                    for h in ((body.get("payload") or {}).get("headers") or [])
+                }
+                sender = hdrs.get("from") or "desconocido"
+                sender = re.sub(r"\s*<[^>]+>", "", sender).strip().strip('"') or sender
+                subj = (hdrs.get("subject") or "(sin asunto)").strip()
+                return {"mid": mid, "sender": sender, "subject": subj, "snippet": body.get("snippet") or ""}
+            except Exception:
+                return None
+
+        emails: list[dict] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            for item in pool.map(_fetch_msg, rows[:10]):
+                if item:
+                    emails.append(item)
         if not emails:
             return f"Hay unos {total} correos sin leer, pero no pude leer los detalles."
 
@@ -1645,18 +1724,7 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
             f"Mensaje: \"{text}\""
         )
         try:
-            resp = requests.post(
-                "http://127.0.0.1:8081/v1/chat/completions",
-                json={
-                    "model": "gpt-oss:20b",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 500,
-                    "temperature": 0.2,
-                },
-                timeout=40,
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
+            content = _call_fast_llm(prompt, max_tokens=150, temperature=0.1)
             content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.M).strip()
             data = json.loads(content)
             to = (data.get("destinatario") or "").strip() or None
@@ -1682,18 +1750,7 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
             f"Mensaje: \"{text}\""
         )
         try:
-            resp = requests.post(
-                "http://127.0.0.1:8081/v1/chat/completions",
-                json={
-                    "model": "gpt-oss:20b",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 200,
-                    "temperature": 0.1,
-                },
-                timeout=20,
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
+            content = _call_fast_llm(prompt, max_tokens=100, temperature=0.1)
             content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.M).strip()
             data = json.loads(content)
             target = (data.get("silenciar") or "").strip()
@@ -1808,9 +1865,10 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
         do_it = bool(re.search(r"(?:lo has|h[aá]zlo|hacer|haces)\s+t[uú]", t))
         opened = bool(re.search(r"ya est[aá] abierto|ya (?:lo\s+)?abr[ií]", t))
         if mentions or ((do_it or opened) and last_mail):
-            mute_target = self._llm_extract_mute_target(raw)
-            if mute_target:
-                return self._mute_email_sender(mute_target)
+            if re.search(r"\b(silencia|deja de|no me muestres|no me hables de|ignora|no quiero ver)\b", t):
+                mute_target = self._llm_extract_mute_target(raw)
+                if mute_target:
+                    return self._mute_email_sender(mute_target)
             return self._gmail_inbox_brief()
         return None
 
@@ -2114,19 +2172,8 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
             f"Mensaje: \"{text}\""
         )
         try:
-            resp = requests.post(
-                "http://127.0.0.1:8081/v1/chat/completions",
-                json={
-                    "model": "gpt-oss:20b",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 500,
-                    "temperature": 0.3,
-                },
-                timeout=40,
-            )
-            resp.raise_for_status()
-            q = resp.json()["choices"][0]["message"]["content"].strip()
-            return q.strip(" .!?,;:\"'«»").split("\n")[0]
+            q = _call_fast_llm(prompt, max_tokens=100, temperature=0.2)
+            return q.strip(" .!?,;:\"'«»").split("\n")[0] if q else ""
         except Exception:
             return ""
 
@@ -2297,6 +2344,7 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
         raw = (transcript or "").strip()
         if not raw:
             return None
+        t = raw.lower()
         close_pattern = (
             r"(?:cierra|quitar|quita|oculta|cerrar|volver|vuelve|salir|sal\s+de).*(?:humanoide|cara|rostro|holograma)"
             r"|(?:vista\s+normal|dashboard|volver\s+al\s+dashboard|vuelve\s+al\s+dashboard|close\s+humanoid)"

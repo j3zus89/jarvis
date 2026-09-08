@@ -41,6 +41,24 @@ from .providers.groq import GroqProvider
 from .providers.openrouter import OpenRouterProvider
 from .quota import ProviderQuota
 
+def _load_env_files() -> None:
+    for p in [Path.home() / ".hermes" / ".env", Path(__file__).resolve().parent.parent / ".env"]:
+        if not p.is_file():
+            continue
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip("'\"")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+        except Exception:
+            pass
+
+_load_env_files()
+
 PROVIDER_CLASSES = {"groq": GroqProvider, "gemini": GeminiProvider,
                     "openrouter_free": OpenRouterProvider, "openrouter_paid": OpenRouterProvider}
 
@@ -146,17 +164,44 @@ def _llm_needs_hermes(text: str) -> bool:
         "Responde con EXACTAMENTE una palabra: AGENTE si necesita el agente "
         "completo, o CHARLA si el asistente puede responder él mismo."
     )
+    # Fast path: Groq / Gemini (0.3-0.5s instead of 10s CPU timeout)
+    for k in [os.environ.get("GROQ_API_KEY"), os.environ.get("GROQ_API_KEY_2"), os.environ.get("GROQ_API_KEY_3")]:
+        if not k:
+            continue
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {k}"},
+                json={"model": "qwen/qwen3.8-27b", "messages": [{"role": "user", "content": prompt}], "max_tokens": 10, "temperature": 0},
+                timeout=2,
+            )
+            if r.ok:
+                out = r.json()["choices"][0]["message"]["content"].strip().upper()
+                return "AGENTE" in out
+        except Exception:
+            pass
+
+    gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if gemini_key:
+        try:
+            r = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                headers={"Authorization": f"Bearer {gemini_key}"},
+                json={"model": "gemini-2.5-flash", "messages": [{"role": "user", "content": prompt}], "max_tokens": 10, "temperature": 0},
+                timeout=2,
+            )
+            if r.ok:
+                out = r.json()["choices"][0]["message"]["content"].strip().upper()
+                return "AGENTE" in out
+        except Exception:
+            pass
+
     try:
         resp = requests.post(
             LOCAL_MODEL_URL,
             json={"model": "gpt-oss:20b", "messages": [{"role": "user", "content": prompt}],
-                  # reasoning_effort matters here, not just latency: without
-                  # it this model spends its whole token budget on hidden
-                  # reasoning_content and returns an EMPTY content string —
-                  # max_tokens alone (even generous) doesn't fix that, found
-                  # live testing this exact call.
                   "max_tokens": 80, "temperature": 0, "reasoning_effort": "low"},
-            timeout=10,
+            timeout=5,
         )
         resp.raise_for_status()
         out = resp.json()["choices"][0]["message"]["content"].strip().upper()
