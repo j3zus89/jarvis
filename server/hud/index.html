@@ -907,9 +907,9 @@ function playChunk(buf){
   for(let i=0;i<i16.length;i++)f32[i]=i16[i]/32768;
   const ab=audioCtx.createBuffer(1,f32.length,ttsRate||24000); ab.copyToChannel(f32,0);
   const src=audioCtx.createBufferSource(); src.buffer=ab; src.connect(getTtsAnalyser()||audioCtx.destination);
-  const lead=(playhead>audioCtx.currentTime)?0.02:0.22;
-  const t=Math.max(audioCtx.currentTime+lead,playhead);
-  src.start(t); playhead=t+ab.duration;
+  const now=audioCtx.currentTime;
+  const start=(playhead > now + 0.005) ? playhead : (now + 0.015);
+  src.start(start); playhead=start+ab.duration;
   activeSources.push(src); src.onended=()=>{activeSources=activeSources.filter(x=>x!==src)};
   audioArrived=true;
 }
@@ -994,7 +994,6 @@ async function greetOnce(){
   await speakElena(line);
 }
 addEventListener("pointerdown", ()=>{ ensureCtx(); }, {capture:true});
-addEventListener("pointerdown", ()=>{ greetOnce(); }, {once:true, capture:true});
 
 /* ====================== humanoid contour view (FASE 5v3) =============== */
 // Reference: a face traced by dense horizontal contour lines that actually
@@ -1784,13 +1783,6 @@ async function bootSequence(full){
   document.querySelectorAll(".panel").forEach((p,i)=>p.style.animationDelay=(120+i*95)+"ms");
   boot.classList.add("done");
   document.body.classList.remove("booting"); document.body.classList.add("booted");
-  if(full){
-    try{
-      const h=new Date().getHours();
-      const f=h<12?"morning":h<18?"afternoon":"evening";
-      await new Audio("audio/boot_"+f+".mp3").play();
-    }catch{/* audio needs a user gesture; B-key boots always have one */}
-  }
   setTimeout(()=>{boot.style.display="none"},900);
   bootRunning=false;
 }

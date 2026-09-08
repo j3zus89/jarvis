@@ -450,7 +450,7 @@ async def _stream_xtts_pcm(text: str) -> AsyncIterator[bytes]:
             ) as resp:
                 if not resp.ok:
                     raise RuntimeError(f"XTTS stream HTTP {resp.status_code}: {resp.text[:200]}")
-                for chunk in resp.iter_content(chunk_size=4096):
+                for chunk in resp.iter_content(chunk_size=16384):
                     if chunk:
                         loop.call_soon_threadsafe(q.put_nowait, chunk)
         except Exception as exc:  # surfaced to the async side below, not swallowed
