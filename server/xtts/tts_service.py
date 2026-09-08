@@ -61,8 +61,8 @@ class TTSRequest(BaseModel):
 def _load_model() -> None:
     global _tts, _gpt_cond_latent, _speaker_embedding
     from TTS.api import TTS
-    torch.set_num_threads(12)
-    print("Cargando XTTS-v2 (optimizado para Ryzen 12 hilos)...", flush=True)
+    torch.set_num_threads(6)
+    print("Cargando XTTS-v2 (optimizado para Ryzen 6 cores fijos para evitar saturación de CPU)...", flush=True)
     _tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
     print("Calculando condicionamiento de la voz de referencia...", flush=True)
     _gpt_cond_latent, _speaker_embedding = _tts.synthesizer.tts_model.get_conditioning_latents(

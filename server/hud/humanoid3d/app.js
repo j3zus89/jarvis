@@ -750,7 +750,7 @@ window.addEventListener('error', function(e) {
     holoTexLeft.needsUpdate = true;
   }
 
-  // Audio effects
+  // Audio effects (futuristic holographic sound)
   let audioCtx = null;
   function playHoloSound(open) {
     let ctx = audioCtx;
@@ -763,34 +763,61 @@ window.addEventListener('error', function(e) {
       ctx.resume().catch(()=>{});
     }
     const tNow = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    
-    osc.connect(gain);
-    gain.connect(ctx.destination);
     
     if (open) {
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(440, tNow);
-      osc.frequency.exponentialRampToValueAtTime(1200, tNow + 0.18);
-      
-      gain.gain.setValueAtTime(0, tNow);
-      gain.gain.linearRampToValueAtTime(0.12, tNow + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.001, tNow + 0.22);
-      
-      osc.start(tNow);
-      osc.stop(tNow + 0.25);
+      // Sub bass resonance surge
+      const sub = ctx.createOscillator();
+      const subGain = ctx.createGain();
+      sub.type = 'sine';
+      sub.frequency.setValueAtTime(65, tNow);
+      sub.frequency.exponentialRampToValueAtTime(160, tNow + 0.35);
+      subGain.gain.setValueAtTime(0, tNow);
+      subGain.gain.linearRampToValueAtTime(0.22, tNow + 0.04);
+      subGain.gain.exponentialRampToValueAtTime(0.001, tNow + 0.5);
+      sub.connect(subGain); subGain.connect(ctx.destination);
+      sub.start(tNow); sub.stop(tNow + 0.52);
+
+      // Resonant holographic sweep
+      const osc = ctx.createOscillator();
+      const filter = ctx.createBiquadFilter();
+      const oscGain = ctx.createGain();
+      osc.type = 'sawtooth';
+      filter.type = 'bandpass';
+      filter.Q.value = 5.0;
+      osc.frequency.setValueAtTime(220, tNow);
+      osc.frequency.exponentialRampToValueAtTime(880, tNow + 0.4);
+      filter.frequency.setValueAtTime(300, tNow);
+      filter.frequency.exponentialRampToValueAtTime(2400, tNow + 0.38);
+      oscGain.gain.setValueAtTime(0, tNow);
+      oscGain.gain.linearRampToValueAtTime(0.12, tNow + 0.05);
+      oscGain.gain.exponentialRampToValueAtTime(0.001, tNow + 0.48);
+      osc.connect(filter); filter.connect(oscGain); oscGain.connect(ctx.destination);
+      osc.start(tNow); osc.stop(tNow + 0.5);
+
+      // Crystal chime arpeggio
+      const freqs = [1046.5, 1318.5, 1567.98, 2093.0];
+      freqs.forEach((f, idx) => {
+        const chime = ctx.createOscillator();
+        const chimeGain = ctx.createGain();
+        const tStart = tNow + 0.08 + idx * 0.06;
+        chime.type = 'sine';
+        chime.frequency.setValueAtTime(f, tStart);
+        chimeGain.gain.setValueAtTime(0, tStart);
+        chimeGain.gain.linearRampToValueAtTime(0.07, tStart + 0.015);
+        chimeGain.gain.exponentialRampToValueAtTime(0.0001, tStart + 0.45);
+        chime.connect(chimeGain); chimeGain.connect(ctx.destination);
+        chime.start(tStart); chime.stop(tStart + 0.5);
+      });
     } else {
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(800, tNow);
-      osc.frequency.exponentialRampToValueAtTime(300, tNow + 0.15);
-      
-      gain.gain.setValueAtTime(0, tNow);
-      gain.gain.linearRampToValueAtTime(0.08, tNow + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.001, tNow + 0.18);
-      
-      osc.start(tNow);
-      osc.stop(tNow + 0.20);
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(980, tNow);
+      osc.frequency.exponentialRampToValueAtTime(140, tNow + 0.28);
+      gain.gain.setValueAtTime(0.12, tNow);
+      gain.gain.exponentialRampToValueAtTime(0.001, tNow + 0.30);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(tNow); osc.stop(tNow + 0.32);
     }
   }
 

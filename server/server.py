@@ -2297,14 +2297,19 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
         raw = (transcript or "").strip()
         if not raw:
             return None
-        t = raw.lower()
-        if re.search(r"mu[eé]stra(?:me)?\s+(?:(?:tu|la|mi)\s+)?cara"
-                     r"|abr[eií]\s+(?:el\s+)?modo\s+humanoide"
-                     r"|show\s+me\s+your\s+face|open\s+humanoid", t):
-            return "Abriendo el modo humanoide."
-        if re.search(r"vista\s+normal|cierra\s+(?:el\s+)?modo\s+humanoide"
-                     r"|close\s+humanoid|vuelve\s+a[l]?\s+(?:el\s+)?dashboard", t):
+        close_pattern = (
+            r"(?:cierra|quitar|quita|oculta|cerrar|volver|vuelve|salir|sal\s+de).*(?:humanoide|cara|rostro|holograma)"
+            r"|(?:vista\s+normal|dashboard|volver\s+al\s+dashboard|vuelve\s+al\s+dashboard|close\s+humanoid)"
+        )
+        if re.search(close_pattern, t):
             return "Volviendo a la vista normal."
+
+        open_pattern = (
+            r"(?:mu[eé]stra|ens[eé][ñn]a|pon|abre|abr[eií]|activa|activar|ver|d[eé]jame\s+ver|quiero\s+ver).*(?:cara|rostro|humanoide|holograma)"
+            r"|(?:modo\s+humanoide|tu\s+cara|tu\s+rostro|c[oó]mo\s+te\s+ves|c[oó]mo\s+eres|show\s+me\s+your\s+face|open\s+humanoid)"
+        )
+        if re.search(open_pattern, t):
+            return "Abriendo el modo humanoide."
         return None
 
     def _try_pc_action(self, transcript: str, conversation: str = "") -> str | None:

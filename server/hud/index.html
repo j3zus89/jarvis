@@ -907,7 +907,8 @@ function playChunk(buf){
   for(let i=0;i<i16.length;i++)f32[i]=i16[i]/32768;
   const ab=audioCtx.createBuffer(1,f32.length,ttsRate||24000); ab.copyToChannel(f32,0);
   const src=audioCtx.createBufferSource(); src.buffer=ab; src.connect(getTtsAnalyser()||audioCtx.destination);
-  const t=Math.max(audioCtx.currentTime+0.06,playhead);
+  const lead=(playhead>audioCtx.currentTime)?0.02:0.22;
+  const t=Math.max(audioCtx.currentTime+lead,playhead);
   src.start(t); playhead=t+ab.duration;
   activeSources.push(src); src.onended=()=>{activeSources=activeSources.filter(x=>x!==src)};
   audioArrived=true;
@@ -951,30 +952,36 @@ async function speakElena(text){
     showStop(false);
   }
 }
-// Varied on purpose — always the same line reads as a bot. Mixes "Jesús"
-// with "jefe" and the playful "Yizus" so it doesn't feel scripted.
+// Saludos con personalidad Jarvis (priorizando "Señor" y "Jefe" con variedad orgánica)
 const GREETINGS=[
-  "Estoy en línea, Jesús.",
-  "Todo listo, jefe.",
-  "Aquí estoy, Yizus.",
-  "Sistemas activos. ¿Qué necesitas, Jesús?",
-  "Buenas, jefe. Todo en orden.",
-  "Conectado y a la espera, Jesús.",
-  "Hola de nuevo, jefe.",
-  "Yizus, ya te escucho.",
-  "En línea. Dime, Jesús.",
-  "Todo operativo, jefe.",
-  "Aquí sigo, Jesús. ¿Qué hacemos?",
-  "Listo para lo que necesites, jefe.",
-  "Sistemas al cien, Yizus.",
-  "Buenas, Jesús. Te escucho.",
-  "Arriba y funcionando, jefe.",
-  "A la orden, Jesús.",
+  "A su orden, Señor.",
+  "Sistemas en línea, Señor. A la espera de sus instrucciones.",
+  "Buenas, Señor. Todo en orden.",
+  "Todo operativo, Señor. ¿En qué trabajamos hoy?",
+  "A la escucha, Señor.",
+  "Listo para lo que necesite, jefe.",
+  "Buenas, jefe. Todos los subsistemas al cien.",
+  "Aquí estoy, Señor. Listo.",
+  "En línea y preparado, Señor.",
+  "Todo listo, jefe. Le escucho.",
+  "Conexión establecida, Señor.",
+  "A la orden, jefe.",
+  "Sistemas activos, Señor. Dígame.",
+  "Aquí estoy, Jesús. Listo cuando usted diga.",
 ];
+let lastGreetingIdx = -1;
+function getNextGreeting(){
+  let idx;
+  do {
+    idx = Math.floor(Math.random() * GREETINGS.length);
+  } while (idx === lastGreetingIdx && GREETINGS.length > 1);
+  lastGreetingIdx = idx;
+  return GREETINGS[idx];
+}
 async function greetOnce(){
   if(greeted) return;
   greeted=true;
-  const line=GREETINGS[Math.floor(Math.random()*GREETINGS.length)];
+  const line=getNextGreeting();
   await speakElena(line);
 }
 addEventListener("pointerdown", ()=>{ ensureCtx(); }, {capture:true});
@@ -1176,8 +1183,75 @@ function humanoidAmpLoop(){
   humanoidPushAmplitude(state==="speaking"?humanoidAmplitude():0);
   humanoidAmpRAF=requestAnimationFrame(humanoidAmpLoop);
 }
+function playFuturisticHoloSound(open){
+  try{
+    const ctx = audioCtx || (window.AudioContext ? new AudioContext() : null);
+    if(!ctx) return;
+    if(ctx.state==='suspended') ctx.resume().catch(()=>{});
+    const t0 = ctx.currentTime;
+
+    if(open){
+      // 1. Sub-harmonic resonant power surge
+      const sub = ctx.createOscillator();
+      const subGain = ctx.createGain();
+      sub.type = 'sine';
+      sub.frequency.setValueAtTime(65, t0);
+      sub.frequency.exponentialRampToValueAtTime(160, t0 + 0.35);
+      subGain.gain.setValueAtTime(0, t0);
+      subGain.gain.linearRampToValueAtTime(0.25, t0 + 0.04);
+      subGain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.5);
+      sub.connect(subGain); subGain.connect(ctx.destination);
+      sub.start(t0); sub.stop(t0 + 0.52);
+
+      // 2. Holographic frequency sweep with bandpass filter
+      const osc = ctx.createOscillator();
+      const filter = ctx.createBiquadFilter();
+      const oscGain = ctx.createGain();
+      osc.type = 'sawtooth';
+      filter.type = 'bandpass';
+      filter.Q.value = 5.0;
+      osc.frequency.setValueAtTime(220, t0);
+      osc.frequency.exponentialRampToValueAtTime(880, t0 + 0.4);
+      filter.frequency.setValueAtTime(300, t0);
+      filter.frequency.exponentialRampToValueAtTime(2400, t0 + 0.38);
+      oscGain.gain.setValueAtTime(0, t0);
+      oscGain.gain.linearRampToValueAtTime(0.12, t0 + 0.05);
+      oscGain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.48);
+      osc.connect(filter); filter.connect(oscGain); oscGain.connect(ctx.destination);
+      osc.start(t0); osc.stop(t0 + 0.5);
+
+      // 3. Digital shimmer / Crystal arpeggio
+      const freqs = [1046.5, 1318.5, 1567.98, 2093.0];
+      freqs.forEach((f, idx) => {
+        const chime = ctx.createOscillator();
+        const chimeGain = ctx.createGain();
+        const tStart = t0 + 0.08 + idx * 0.06;
+        chime.type = 'sine';
+        chime.frequency.setValueAtTime(f, tStart);
+        chimeGain.gain.setValueAtTime(0, tStart);
+        chimeGain.gain.linearRampToValueAtTime(0.08, tStart + 0.015);
+        chimeGain.gain.exponentialRampToValueAtTime(0.0001, tStart + 0.45);
+        chime.connect(chimeGain); chimeGain.connect(ctx.destination);
+        chime.start(tStart); chime.stop(tStart + 0.5);
+      });
+    } else {
+      // Futuristic power down / dismiss sweep
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(980, t0);
+      osc.frequency.exponentialRampToValueAtTime(140, t0 + 0.28);
+      gain.gain.setValueAtTime(0.12, t0);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.30);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(t0); osc.stop(t0 + 0.32);
+    }
+  }catch(e){}
+}
+
 function toggleHumanoid(on){
   humanoidOn=on;
+  playFuturisticHoloSound(on);
   const el=$("humanoidView"); if(!el)return;
   const f=$("humanoidFrame");
   if(on){
