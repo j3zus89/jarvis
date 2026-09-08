@@ -927,15 +927,6 @@ function stopSpeakAudio(){
 async function speakElena(text){
   let t=String(text||"").trim();
   if(!t) return;
-  // Para respuestas largas de chat, sintetizar las 1-2 primeras frases para respuesta inmediata sin lag
-  if(t.length > 250) {
-    const periodIdx = t.indexOf('.', 100);
-    if(periodIdx !== -1 && periodIdx < 280) {
-      t = t.slice(0, periodIdx + 1);
-    } else {
-      t = t.slice(0, 220).replace(/\s+[^\s]*$/, "") + "...";
-    }
-  }
   try{
     await ensureCtx();
     const r=await fetch("/api/speak",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -1448,6 +1439,13 @@ async function sendChat(){
   inp.value="";
   addMsg("you",shownAttachment?`📎 ${shownAttachment.filename}${text?" — "+text:""}`:text);
   setState("thinking","PROCESANDO");
+  if(/^\/(new|reset|clear)\b/i.test(text)){
+    setTimeout(()=>{feed.innerHTML="";addMsg("sys","conversación reiniciada");},800);
+  }
+  if(wsReady){
+    ws.send(JSON.stringify({type:"chat", text:payload, conversation:CONV}));
+    return;
+  }
   try{
     const r=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({input:payload,conversation:CONV})});
@@ -1456,12 +1454,12 @@ async function sendChat(){
     (j.tools||[]).forEach(t=>addActivity("",t.name,t.preview));
     addMsg("jarvis",j.text||"(sin respuesta)");
     refreshAiStatus();
-    if(j.text){ checkHumanoidTrigger(j.text); await speakElena(j.text); }
-    if(/^\/(new|reset|clear)\b/i.test(text)){     // slash reset → also clear the visible feed
-      setTimeout(()=>{feed.innerHTML="";addMsg("sys","conversación reiniciada");},800);
-    }
-  }catch(err){ addMsg("sys","error de chat: "+err.message); }
-  if(state!=="listening")setState("standby","EN ESPERA");
+    setState("standby","EN ESPERA");
+    if(j.text){ checkHumanoidTrigger(j.text); speakElena(j.text); }
+  }catch(err){ 
+    addMsg("sys","error de chat: "+err.message); 
+    setState("standby","EN ESPERA");
+  }
 }
 $("sendBtn").onclick=sendChat;
 $("clearBtn").onclick=()=>{feed.innerHTML="";addMsg("sys","chat visible borrado (el historial sigue en Hermes — escribe /new para reiniciar)");};
