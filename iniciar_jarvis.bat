@@ -22,6 +22,10 @@ echo Arrancando dashboard Hermes (9119)...
 powershell -NoProfile -Command "try { $t=New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1',9119); $t.Close(); exit 0 } catch { exit 1 }"
 if errorlevel 1 start "" /MIN hermes.exe dashboard --no-open --skip-build --port 9119
 
+echo Arrancando servicio de voz local (8790)...
+powershell -NoProfile -Command "try { $t=New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1',8790); $t.Close(); exit 0 } catch { exit 1 }"
+if errorlevel 1 start "" /MIN /D "%HUD%\xtts" "%HUD%\xtts\.venv\Scripts\python.exe" tts_service.py
+
 echo Arrancando HUD...
 powershell -NoProfile -Command "try { $t=New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1',8766); $t.Close(); exit 0 } catch { exit 1 }"
 if errorlevel 1 start "" /MIN /D "%HUD%" "%PY%" -u server.py
