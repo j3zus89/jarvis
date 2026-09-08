@@ -1,0 +1,216 @@
+@import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;500;700&family=Orbitron:wght@500;700&display=swap');
+
+:root {
+  --cyan: #22e9ff;
+  --violet: #8a5bff;
+  --ink: #cfeaff;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: #02030a;
+  font-family: 'Chakra Petch', sans-serif;
+  color: var(--ink);
+}
+
+#scene {
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(120% 90% at 50% 42%, rgba(180, 60, 255, 0.10), rgba(8, 2, 14, 0) 55%),
+    radial-gradient(140% 120% at 50% 116%, rgba(255, 90, 40, 0.08), rgba(6, 2, 10, 0) 60%),
+    radial-gradient(circle at 50% 50%, #0a0414 0%, #06030c 68%, #020104 100%);
+}
+
+canvas {
+  display: block;
+}
+
+.vignette {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(circle at 50% 47%, rgba(0, 0, 0, 0) 50%, rgba(0, 0, 0, 0.74) 100%);
+}
+
+.hud {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.pill {
+  position: absolute;
+  top: 26px;
+  left: 28px;
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 18px;
+  border-radius: 40px;
+  background: rgba(10, 16, 38, 0.42);
+  backdrop-filter: blur(14px);
+  border: 1px solid rgba(34, 233, 255, 0.22);
+  box-shadow: 0 0 40px rgba(34, 233, 255, 0.08);
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 12px var(--cyan);
+  animation: bp 2.4s ease-in-out infinite;
+}
+
+@keyframes bp {
+  50% {
+    opacity: 0.4;
+    transform: scale(0.7);
+  }
+}
+
+.pill .lab {
+  font-size: 11px;
+  letter-spacing: 0.32em;
+  text-transform: uppercase;
+  opacity: 0.6;
+}
+
+.pill .st {
+  font-family: 'Orbitron';
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.18em;
+  color: #eafbff;
+}
+
+.subwrap {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 150px;
+  text-align: center;
+  padding: 0 8%;
+}
+
+.subtitle {
+  display: inline-block;
+  font-size: clamp(15px, 2.2vw, 24px);
+  font-weight: 300;
+  letter-spacing: 0.04em;
+  color: #eafbff;
+  text-shadow: 0 0 24px rgba(34, 233, 255, 0.5);
+  min-height: 1.4em;
+  border-right: 2px solid rgba(34, 233, 255, 0);
+  white-space: pre-wrap;
+}
+
+.subtitle.typing {
+  border-right-color: rgba(34, 233, 255, 0.8);
+  animation: cur 0.7s step-end infinite;
+}
+
+@keyframes cur {
+  50% {
+    border-right-color: transparent;
+  }
+}
+
+.controls {
+  position: absolute;
+  left: 50%;
+  bottom: 40px;
+  transform: translateX(-50%);
+  pointer-events: auto;
+  display: flex;
+  gap: 14px;
+  padding: 14px;
+  border-radius: 60px;
+  background: rgba(8, 12, 28, 0.55);
+  backdrop-filter: blur(18px);
+  border: 1px solid rgba(34, 233, 255, 0.18);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6), 0 0 50px rgba(34, 233, 255, 0.06);
+}
+
+button {
+  font-family: 'Chakra Petch';
+  cursor: pointer;
+  color: #dff6ff;
+  font-size: 12.5px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  padding: 13px 22px;
+  border-radius: 40px;
+  border: 1px solid rgba(34, 233, 255, 0.3);
+  background: linear-gradient(180deg, rgba(34, 233, 255, 0.12), rgba(34, 233, 255, 0.03));
+  transition: 0.25s;
+}
+
+button:hover {
+  border-color: rgba(34, 233, 255, 0.7);
+  background: linear-gradient(180deg, rgba(34, 233, 255, 0.28), rgba(34, 233, 255, 0.06));
+  box-shadow: 0 0 28px rgba(34, 233, 255, 0.35);
+  transform: translateY(-2px);
+}
+
+button.go {
+  border-color: rgba(255, 211, 122, 0.55);
+  color: #fff0d0;
+  background: linear-gradient(180deg, rgba(255, 211, 122, 0.16), rgba(255, 211, 122, 0.03));
+}
+
+button.holo-active-btn {
+  border-color: rgba(34, 233, 255, 0.9);
+  color: #e6ffff;
+  background: linear-gradient(180deg, rgba(34, 233, 255, 0.3), rgba(34, 233, 255, 0.08));
+  box-shadow: 0 0 24px rgba(34, 233, 255, 0.4);
+}
+
+.interactive-telemetry {
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.interactive-telemetry:hover {
+  color: var(--cyan);
+  text-shadow: 0 0 10px rgba(34, 233, 255, 0.6);
+}
+
+#intro {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: #02030a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 1.6s ease 1.2s;
+}
+
+#intro.gone {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.hint {
+  position: absolute;
+  bottom: 210px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  opacity: 0.4;
+  transition: opacity 1s;
+}

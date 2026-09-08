@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JARVIS CORE — Nebula Fire Spirit</title>
+  <meta name="description" content="JARVIS Core - An interactive 3D spirit face built with Three.js and custom WebGL shaders for advanced multi-agent systems orchestration.">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    /* Embebido dentro del HUD real de Jarvis: se oculta el panel de
+       controles de demo y la pildora de estado propios — el estado real
+       lo empuja la pagina padre via jarvisSetState(). */
+    .controls,.pill,.hint{display:none!important}
+  </style>
+</head>
+<body>
+  <!-- Background WebGL Scene Container -->
+  <main id="scene"></main>
+  
+  <div class="vignette"></div>
+  
+  <!-- Interactive Head-Up Display (HUD) -->
+  <div class="hud" id="hudContainer">
+    <!-- Top-left Status Pill -->
+    <header class="pill" id="pillNode" aria-label="System status indicator">
+      <span class="dot" id="dot" aria-hidden="true"></span>
+      <div>
+        <h1 class="lab">Jarvis Core</h1>
+        <div class="st" id="stateLabel">BOOTING</div>
+      </div>
+    </header>
+
+    <!-- Center Subtitles Output -->
+    <section class="subwrap" aria-live="polite">
+      <span class="subtitle" id="sub"></span>
+    </section>
+
+    <!-- Bottom Controls Deck -->
+    <nav class="controls" aria-label="Core controls">
+      <button id="bListen">Listen</button>
+      <button id="bThink">Think</button>
+      <button id="bSpeak">Speak</button>
+      <button id="bShow" class="go">✦ Black Hole</button>
+      <button id="bGiga" class="go">✦ Giga</button>
+      <button id="bHolo" class="go">✦ Holo</button>
+    </nav>
+
+    <!-- Bottom Hint -->
+    <footer class="hint" id="hint">interact with particles · move mouse</footer>
+  </div>
+
+  <!-- Onboarding Intro Overlay -->
+  <div id="intro" aria-hidden="true"></div>
+
+  <!-- Javascript Modules -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+  <script src="app.js?v=5"></script>
+  <script src="telemetry.js"></script>
+</body>
+</html>

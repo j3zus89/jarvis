@@ -1,0 +1,6 @@
+name: job_search
+version: 1.0.0
+description: JOB_AGENT — job search profile lookup and offer matching/scoring
+provides_tools:
+  - job_profile
+  - job_match

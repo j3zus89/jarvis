@@ -1,0 +1,129 @@
+# Copy to server.yaml and edit. Secrets live in ~/.hermes/.env (NOT here).
+
+llm:
+  provider: hermes            # "router" = try free online APIs first, Hermes as final fallback (see ai_router below).
+  model: claude-haiku-4-5     # used only by the anthropic fallback provider
+  api_key_env: ANTHROPIC_API_KEY
+  max_tokens: 220
+  temperature: 0.3
+  history_turns: 12           # fallback provider + ai_router only (chat history sent to non-Hermes providers)
+
+# Only used when llm.provider is "router". Cascades through free-tier online
+# APIs before Hermes; any turn that looks like it needs a Hermes-exclusive
+# capability (terminal, real web search, files, cron/kanban, skills) skips
+# the cascade and goes straight to Hermes — see server/ai_router/router.py.
+# Keys come from GROQ_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY in
+# ~/.hermes/.env (never here) — a provider with no key set is skipped.
+ai_router:
+  enabled: true
+  # order to try; hermes is always the final fallback. OpenRouter's paid
+  # tier sits LAST online — it's real money (a small prepaid balance, no
+  # card, no auto-recharge), only touched once every free tier is down.
+  priority: [groq, gemini, openrouter_free, openrouter_paid]
+  quota_threshold_pct: 80                # proactively skip a provider past this % of daily_request_limit
+  groq:
+    model: openai/gpt-oss-120b           # ~500 tok/s, 131K ctx, tool-calling — verify at console.groq.com/docs/models
+    api_key_env: GROQ_API_KEY
+    daily_request_limit: 1000            # verify at console.groq.com/settings/limits (30 RPM either way)
+    reasoning_effort: low                # measured: ~40% faster, ~4x fewer hidden reasoning tokens, same answer quality
+  gemini:
+    model: gemini-2.5-flash
+    api_key_env: GEMINI_API_KEY
+    daily_request_limit: 1000            # verify at aistudio.google.com/rate-limit (10-15 RPM either way)
+    thinking_budget: 0                   # measured: ~60% faster, avoids truncating short answers (was eating maxOutputTokens)
+  openrouter:
+    api_key_env: OPENROUTER_API_KEY      # shared by both free and paid_fallback below
+    free:
+      enabled: true
+      model: openrouter/free             # OpenRouter's self-maintained free alias — avoids hardcoding a :free model that rotates out
+      daily_request_limit: 50            # 20 RPM/50 RPD without purchases, 1000 RPD with $10+ lifetime purchased — verify at openrouter.ai/docs
+    paid_fallback:
+      enabled: true
+      model: openai/gpt-oss-20b          # cheap (~$0.03/$0.13 per 1M tok) — verify at openrouter.ai/models
+      max_spend: 3.79                    # HARD lifetime cap in USD — never spend more than this, ever. See server/ai_router/cost_guard.py.
+      price_per_mtok_input: 0.03         # $ per 1M input tokens — re-verify if you change the model above
+      price_per_mtok_output: 0.13        # $ per 1M output tokens
+      # set to 0 (or remove max_spend) to disable the paid tier entirely —
+      # it is then skipped at startup, never attempted.
+    reasoning:                           # deep-reasoning escalation — see docs/AI_ROUTER.md
+      enabled: true
+      model: anthropic/claude-opus-5-20260723   # swap to openai/gpt-6-astra later, 2x this price today
+      effort: low                        # low|medium|high|xhigh|max
+      max_spend: 3.20                    # HARD lifetime cap in USD — set to your real balance
+      daily_max_spend: 1.00              # HARD daily cap — safety net against a runaway session
+      max_cost_per_request: 0.20         # HARD per-request cap
+      price_per_mtok_input: 5.0          # re-verify at openrouter.ai/models if you change the model
+      price_per_mtok_output: 25.0
+      # shares OPENROUTER_API_KEY with paid_fallback above — same account,
+      # each tier's cap independently checked against the live remaining
+      # balance, so the two can't combine to overspend the real account.
+
+hermes:
+  base_url: http://127.0.0.1:8642   # Hermes Agent API server (loopback)
+  api_key_env: API_SERVER_KEY       # read from ~/.hermes/.env
+  conversation: jarvis-main          # shared voice + HUD thread name
+  session_key: jarvis:user:main      # stable long-term memory scope
+  timeout: 240
+  ack_after_seconds: 0               # >0 = speak a short ack while the agent works
+  ack_texts: ["On it.", "Still working.", "Almost there."]
+  fallback_provider: anthropic
+  instructions: >
+    You are speaking aloud through a voice pipeline. Replies are converted
+    to speech, so use plain conversational prose only: no markdown, no lists,
+    no code blocks. Default to one to three short sentences unless asked for
+    more detail. Speak numbers, dates, times and phone numbers as natural
+    spoken words. Never speak secrets, API keys, or passwords aloud.
+
+stt:
+  model: small.en           # LOCAL model (fallback if remote configured; primary otherwise)
+  device: cpu
+  compute_type: int8
+  sample_rate: 16000
+  partials: true            # live transcript while speaking
+  partial_interval: 1.2     # seconds of new audio between partial passes
+  # Optional GPU worker (worker/stt_server.py on any NVIDIA machine):
+  # big-model accuracy at ~0.2s. Falls back to the local model automatically.
+  # remote:
+  #   name: gpu
+  #   url: http://192.168.1.50:8768/stt
+  #   token_env: JARVIS_HUD_TOKEN
+  #   timeout: 6
+
+machines:                   # polled by /api/machines for the HUD panel (optional)
+  - name: "GPU WORKER"
+    host: 192.168.1.50
+    stats_url: http://192.168.1.50:8767/stats   # run worker/worker_stats.py there
+    ping_port: 445
+
+usage:
+  # Your LLM provider's pricing ($ per 1M tokens) for HUD cost estimates. 0 = token counts only.
+  llm_cost_per_mtok_input: 0
+  llm_cost_per_mtok_output: 0
+
+server:
+  host: 0.0.0.0              # wildcard bind (required for non-root port 443 on macOS)
+  port: 8765                 # plain ws:// for the Python push-to-talk client
+  tls_ports: [443, 8766]     # https/wss for the HUD (browser mic requires TLS)
+  tls_cert: certs/cert.pem
+  tls_key: certs/key.pem
+  dashboard_proxy:           # TLS reverse proxy so the HUD can iframe the Hermes dashboard
+    port: 9443
+    target: http://127.0.0.1:9119
+
+security:
+  hud_token_env: JARVIS_HUD_TOKEN   # set in ~/.hermes/.env; unset = auth disabled
+  extra_origin_hosts: []            # e.g. ["192.168.1.10"] if you open the HUD by raw IP
+
+voice:
+  provider: edge-tts
+  model: edge-tts
+  voice_name: "Elena (Argentina)"
+  voice_id: es-AR-ElenaNeural
+  output_format: pcm_24000
+  rate: "+0%"
+  pitch: "+0Hz"
+
+persona:                     # used only by the anthropic fallback path
+  system_prompt: >
+    You are the spoken interface for the user's personal agent. Be direct,
+    calm, and concise. Default to one to three short sentences.
