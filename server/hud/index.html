@@ -854,7 +854,6 @@ function connect(){
     }
     else if(e.type==="error"){ clearLive(); addMsg("sys","error: "+e.message); setState("standby","EN ESPERA"); showStop(false); }
     else if(e.type==="done"){
-      flushAudioQueue();
       currentRun=null; showStop(false);
       const tm=e.timing||{};
       turns++; setNumber($("mTurns"),turns);
@@ -867,7 +866,7 @@ function connect(){
       setTimeout(()=>{if(state!=="listening")setState("standby","EN ESPERA")},400);
       if(keepVoice){
         const waitIdle=()=>{
-          if(activeSources.length || audioQueue.length){ listenResumeTimer=setTimeout(waitIdle,300); return; }
+          if(activeSources.length){ listenResumeTimer=setTimeout(waitIdle,300); return; }
           listenResumeTimer=setTimeout(()=>{ if(!capturing && voiceTurn && wsReady) toggleTalk(); }, 600);
         };
         listenResumeTimer=setTimeout(waitIdle,500);
@@ -896,38 +895,19 @@ function getTtsAnalyser(){
   }
   return ttsAnalyser;
 }
-let audioQueue=[];
-let queueDuration=0;
-let isPlayingQueue=false;
-let prerollTimer=null;
-const JITTER_BUFFER_SEC=0.35;
-
-function flushAudioQueue(){
-  if(prerollTimer){ clearTimeout(prerollTimer); prerollTimer=null; }
-  if(!audioCtx || !audioQueue.length) return;
-  const now=audioCtx.currentTime;
-  let start=(playhead > now + 0.010) ? playhead : (now + 0.035);
-  while(audioQueue.length){
-    const ab=audioQueue.shift();
-    const src=audioCtx.createBufferSource();
-    src.buffer=ab;
-    src.connect(getTtsAnalyser()||audioCtx.destination);
-    src.start(start);
-    activeSources.push(src);
-    src.onended=()=>{ activeSources=activeSources.filter(x=>x!==src); if(!activeSources.length) isPlayingQueue=false; };
-    start += ab.duration;
-  }
-  playhead=start;
-  queueDuration=0;
-  isPlayingQueue=true;
-  audioArrived=true;
-}
+// ── Audio playback ──────────────────────────────────────────────────────────
+// With XTTS on GPU (RTF ≈ 0.89), each chunk arrives BEFORE the previous one
+// finishes playing, so we never need a jitter buffer.  Simple rule:
+//   start = Math.max(playhead, now + LOOKAHEAD_S)
+// This guarantees gapless playback for in-sequence chunks and a tiny look-ahead
+// gap for the very first chunk of each turn.
+const LOOKAHEAD_S = 0.015;   // 15 ms look-ahead for first chunk of each turn
 
 function playChunk(buf){
   if(!audioCtx){
-    try{ audioCtx=new (window.AudioContext||window.webkitAudioContext)(); }catch{return}
+    try{ audioCtx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:"playback"}); }catch{return}
   }
-  if(audioCtx.state==="suspended") audioCtx.resume();
+  if(audioCtx.state==="suspended") audioCtx.resume().catch(()=>{});
   let bytes=new Uint8Array(buf);
   if(leftoverByte!==null){const m=new Uint8Array(bytes.length+1);m[0]=leftoverByte;m.set(bytes,1);bytes=m;leftoverByte=null}
   if(bytes.length%2===1){leftoverByte=bytes[bytes.length-1];bytes=bytes.subarray(0,bytes.length-1)}
@@ -935,34 +915,19 @@ function playChunk(buf){
   const i16=new Int16Array(bytes.buffer,bytes.byteOffset,bytes.length/2);
   const f32=new Float32Array(i16.length);
   for(let i=0;i<i16.length;i++)f32[i]=i16[i]/32768;
-  const ab=audioCtx.createBuffer(1,f32.length,ttsRate||24000); ab.copyToChannel(f32,0);
-
+  const rate=ttsRate||24000;
+  const ab=audioCtx.createBuffer(1,f32.length,rate); ab.copyToChannel(f32,0);
+  const src=audioCtx.createBufferSource(); src.buffer=ab;
+  src.connect(getTtsAnalyser()||audioCtx.destination);
   const now=audioCtx.currentTime;
-  if(isPlayingQueue && playhead > now + 0.050){
-    const src=audioCtx.createBufferSource();
-    src.buffer=ab;
-    src.connect(getTtsAnalyser()||audioCtx.destination);
-    src.start(playhead);
-    playhead += ab.duration;
-    activeSources.push(src);
-    src.onended=()=>{ activeSources=activeSources.filter(x=>x!==src); if(!activeSources.length) isPlayingQueue=false; };
-    audioArrived=true;
-    return;
-  }
-
-  audioQueue.push(ab);
-  queueDuration += ab.duration;
-  if(queueDuration >= JITTER_BUFFER_SEC || audioQueue.length >= 2){
-    flushAudioQueue();
-  } else if(!prerollTimer){
-    prerollTimer=setTimeout(flushAudioQueue, 200);
-  }
+  const start=Math.max(playhead, now + LOOKAHEAD_S);
+  src.start(start);
+  playhead=start+ab.duration;
+  activeSources.push(src);
+  src.onended=()=>{activeSources=activeSources.filter(x=>x!==src)};
+  audioArrived=true;
 }
 function stopPlayback(){
-  if(prerollTimer){ clearTimeout(prerollTimer); prerollTimer=null; }
-  audioQueue=[];
-  queueDuration=0;
-  isPlayingQueue=false;
   activeSources.forEach(s=>{try{s.stop()}catch{}});
   activeSources=[];
   playhead=0;
