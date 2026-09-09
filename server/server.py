@@ -43,7 +43,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncIterator, Iterator
+from typing import AsyncIterator, Iterator, Literal
 
 import edge_tts
 import miniaudio
@@ -55,6 +55,7 @@ from anthropic import Anthropic
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, ValidationError
 from RealtimeSTT import AudioToTextRecorder
 
 from ai_router import AIRouter, AllProvidersFailedError
@@ -92,6 +93,80 @@ LOG_PATH = ROOT / "logs" / "latency.jsonl"
 STATE_PATH = ROOT / "logs" / "hermes_sessions.json"
 USAGE_PATH = ROOT / "logs" / "usage_stats.json"
 _USAGE_LOCK = threading.Lock()
+_LOG_ROTATION_LOCK = threading.Lock()
+
+
+def _append_rotating_jsonl(path: Path, data: dict, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 3) -> None:
+    """Thread-safe, bounded JSONL append with automatic rotation."""
+    line = json.dumps(data, ensure_ascii=False) + "\n"
+    encoded = line.encode("utf-8")
+    with _LOG_ROTATION_LOCK:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and (path.stat().st_size + len(encoded)) > max_bytes:
+                for i in range(backup_count - 1, 0, -1):
+                    src = path.with_name(f"{path.name}.{i}")
+                    dst = path.with_name(f"{path.name}.{i+1}")
+                    if src.exists():
+                        try:
+                            if dst.exists():
+                                dst.unlink()
+                            src.rename(dst)
+                        except OSError:
+                            pass
+                first_backup = path.with_name(f"{path.name}.1")
+                if first_backup.exists():
+                    try:
+                        first_backup.unlink()
+                    except OSError:
+                        pass
+                try:
+                    path.rename(first_backup)
+                except OSError:
+                    pass
+            with path.open("ab") as f:
+                f.write(encoded)
+        except Exception as exc:
+            print(f"Log rotation write failed for {path.name}: {exc}", flush=True)
+
+
+class WSStartEvent(BaseModel):
+    type: Literal["start"]
+    sample_rate: int = 16000
+    format: str = "pcm_s16le"
+    channels: int = 1
+    conversation: str | None = None
+
+
+class WSStopEvent(BaseModel):
+    type: Literal["stop"]
+
+
+class WSStopRunEvent(BaseModel):
+    type: Literal["stop_run"]
+
+
+class WSChatEvent(BaseModel):
+    type: Literal["chat"]
+    text: str
+    conversation: str | None = None
+
+
+class WSApprovalDecisionEvent(BaseModel):
+    type: Literal["approval_decision"]
+    run_id: str | None = None
+    approval_id: str | None = None
+    decision: str = "deny"
+
+
+def _safe_open_browser(url: str, new: int = 2) -> None:
+    """Abre URLs en navegador sin bloquear el hilo ni el Event Loop."""
+    try:
+        threading.Thread(target=webbrowser.open, args=(url,), kwargs={"new": new}, daemon=True).start()
+    except Exception as exc:
+        print(f"webbrowser open failed: {exc}", flush=True)
+
+
 
 
 def _call_fast_llm(prompt: str, max_tokens: int = 300, temperature: float = 0.1) -> str:
@@ -361,27 +436,25 @@ _VOICE_FX_CHAIN = (
 
 
 def _apply_voice_fx(mp3_bytes: bytes) -> bytes:
-    """Pasa el MP3 crudo de Edge TTS por la cadena de efectos de voz futurista.
-    Si ffmpeg no está disponible o falla, se devuelve el audio sin procesar
-    en vez de romper la respuesta de voz."""
-    tmpdir = tempfile.mkdtemp(prefix="jarvis-tts-fx-")
+    """Pasa el MP3 crudo de Edge TTS por la cadena de efectos de voz futurista en RAM.
+    Usa pipes de stdin/stdout en memoria sin tocar disco ni archivos temporales.
+    Si ffmpeg no está disponible o falla, se devuelve el audio sin procesar."""
+    if not mp3_bytes:
+        return mp3_bytes
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        src = Path(tmpdir) / "in.mp3"
-        dst = Path(tmpdir) / "out.mp3"
-        src.write_bytes(mp3_bytes)
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(src), "-af", _VOICE_FX_CHAIN, "-codec:a", "mp3", str(dst)],
-            capture_output=True, timeout=15,
+            ["ffmpeg", "-y", "-i", "pipe:0", "-af", _VOICE_FX_CHAIN, "-codec:a", "mp3", "-f", "mp3", "pipe:1"],
+            input=mp3_bytes,
+            capture_output=True,
+            timeout=10,
+            creationflags=flags,
         )
-        if result.returncode == 0 and dst.exists():
-            data = dst.read_bytes()
-            if data:
-                return data
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
         print(f"voice fx failed, using raw audio: {result.stderr[-300:]!r}", flush=True)
     except Exception as exc:
         print(f"voice fx error, using raw audio: {exc!r}", flush=True)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
     return mp3_bytes
 
 
@@ -398,62 +471,82 @@ def _jitter_signed(value: str, unit: str, spread: int) -> str:
 
 
 _XTTS_SERVICE_URL = "http://127.0.0.1:8790"
+_XTTS_CIRCUIT_COOLDOWN = 30.0  # seconds cooldown after failure
+_XTTS_CIRCUIT_OPEN_UNTIL = 0.0
+
+
+def _is_xtts_available() -> bool:
+    return time.time() >= _XTTS_CIRCUIT_OPEN_UNTIL
+
+
+def _trip_xtts_circuit(reason: str) -> None:
+    global _XTTS_CIRCUIT_OPEN_UNTIL
+    _XTTS_CIRCUIT_OPEN_UNTIL = time.time() + _XTTS_CIRCUIT_COOLDOWN
+    print(f"[XTTS Circuit Breaker] Activado por {int(_XTTS_CIRCUIT_COOLDOWN)}s debido a: {reason}", flush=True)
+
+
+def _convert_wav_to_mp3_in_memory(wav_bytes: bytes) -> bytes:
+    """Convierte WAV a MP3 100% en memoria mediante pipe ffmpeg."""
+    if not wav_bytes:
+        return b""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0", "-codec:a", "mp3", "-f", "mp3", "pipe:1"],
+            input=wav_bytes,
+            capture_output=True,
+            timeout=10,
+            creationflags=flags,
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
+        print(f"xtts wav->mp3 pipe failed, using raw wav: {result.stderr[-300:]!r}", flush=True)
+    except Exception as exc:
+        print(f"xtts wav->mp3 error: {exc!r}", flush=True)
+    return wav_bytes
 
 
 async def _synthesize_xtts_mp3(text: str) -> bytes:
-    """Local XTTS-v2 voice clone (server/xtts/tts_service.py, must be running
-    separately -- see docs/AI_ROUTER.md). Free, offline, no per-sentence
-    network call. Returns the service's WAV re-encoded to MP3 via ffmpeg (same
-    binary _apply_voice_fx already depends on) so callers of
-    synthesize_edge_mp3 don't need to know which engine answered."""
-    resp = await asyncio.to_thread(
-        requests.post, f"{_XTTS_SERVICE_URL}/tts", json={"text": text}, timeout=60,
-    )
+    """Local XTTS-v2 voice clone (server/xtts/tts_service.py).
+    Decodificado y convertido a MP3 directamente en memoria sin I/O de disco."""
+    if not _is_xtts_available():
+        raise RuntimeError("XTTS circuit breaker open (cooldown activo)")
+    try:
+        resp = await asyncio.to_thread(
+            requests.post, f"{_XTTS_SERVICE_URL}/tts", json={"text": text}, timeout=(3.0, 20.0),
+        )
+    except Exception as exc:
+        _trip_xtts_circuit(str(exc))
+        raise
     if not resp.ok:
+        _trip_xtts_circuit(f"HTTP {resp.status_code}")
         raise RuntimeError(f"XTTS service HTTP {resp.status_code}: {resp.text[:200]}")
     wav_bytes = resp.content
     if not wav_bytes:
         raise RuntimeError("XTTS service returned empty audio")
-    tmpdir = tempfile.mkdtemp(prefix="jarvis-xtts-")
-    try:
-        wav_path = Path(tmpdir) / "in.wav"
-        mp3_path = Path(tmpdir) / "out.mp3"
-        wav_path.write_bytes(wav_bytes)
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(wav_path), "-codec:a", "mp3", str(mp3_path)],
-            capture_output=True, timeout=15,
-        )
-        if result.returncode == 0 and mp3_path.exists():
-            data = mp3_path.read_bytes()
-            if data:
-                return data
-        print(f"xtts wav->mp3 failed, using raw wav: {result.stderr[-300:]!r}", flush=True)
-        return wav_bytes
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    return await asyncio.to_thread(_convert_wav_to_mp3_in_memory, wav_bytes)
 
 
 async def _stream_xtts_pcm(text: str) -> AsyncIterator[bytes]:
-    """Real streaming, not just chunked-after-the-fact: consumes
-    /tts_stream's raw PCM16 chunks as XTTS generates them (first chunk
-    ~1.7s in, vs ~12-16s to wait for a whole sentence via /tts). Bridges the
-    blocking `requests` stream into an async generator via a thread + queue
-    -- asyncio has no native way to iterate a sync HTTP stream without
-    blocking the event loop."""
+    """Real streaming, consumes /tts_stream raw PCM16 chunks as XTTS generates them.
+    Protegido con timeout estricto y circuit breaker."""
+    if not _is_xtts_available():
+        raise RuntimeError("XTTS circuit breaker open (cooldown activo)")
     q: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
     def worker() -> None:
         try:
             with requests.post(
-                f"{_XTTS_SERVICE_URL}/tts_stream", json={"text": text}, stream=True, timeout=60,
+                f"{_XTTS_SERVICE_URL}/tts_stream", json={"text": text}, stream=True, timeout=(3.0, 15.0),
             ) as resp:
                 if not resp.ok:
                     raise RuntimeError(f"XTTS stream HTTP {resp.status_code}: {resp.text[:200]}")
                 for chunk in resp.iter_content(chunk_size=16384):
                     if chunk:
                         loop.call_soon_threadsafe(q.put_nowait, chunk)
-        except Exception as exc:  # surfaced to the async side below, not swallowed
+        except Exception as exc:
+            _trip_xtts_circuit(str(exc))
             loop.call_soon_threadsafe(q.put_nowait, exc)
         finally:
             loop.call_soon_threadsafe(q.put_nowait, None)
@@ -469,41 +562,43 @@ async def _stream_xtts_pcm(text: str) -> AsyncIterator[bytes]:
 
 
 async def synthesize_edge_mp3(text: str) -> bytes:
-    """Elena (es-AR) MP3 via Microsoft Edge TTS -- unless voice.provider is
-    "xtts" in config, in which case this delegates to the local voice-clone
-    service instead. Kept as one entry point (not two call sites branching)
-    so both /api/speak and the live voice turn stay untouched."""
+    """Elena (es-AR) o voz configurada MP3 via Microsoft Edge TTS -- streaming directo
+    en memoria sin tocar archivos temporales en SSD."""
     voice = CFG.get("voice") or {}
-    if str(voice.get("provider") or "") == "xtts":
+    if str(voice.get("provider") or "") == "xtts" and _is_xtts_available():
         try:
             return await _synthesize_xtts_mp3(text)
         except Exception as exc:
             print(f"[TTS Fallback] XTTS falló ({exc}), usando fallback inmediato Edge-TTS...", flush=True)
-    voice_id = str(voice.get("voice_id") or "es-ES-AlvaroNeural")
+    # Edge TTS fallback: never use "xtts-local" as voice_id (it's not a valid Edge voice)
+    raw_voice_id = str(voice.get("voice_id") or "es-ES-AlvaroNeural")
+    voice_id = raw_voice_id if not raw_voice_id.startswith("xtts") else "es-ES-AlvaroNeural"
     rate = _jitter_signed(str(voice.get("rate") or "+0%"), "%", 4)
     pitch = str(voice.get("pitch") or "+0Hz")
     if pitch.endswith("%"):
         pitch = pitch[:-1] + "Hz"
     pitch = _jitter_signed(pitch, "Hz", 6)
-    tmpdir = tempfile.mkdtemp(prefix="jarvis-tts-")
-    mp3_path = Path(tmpdir) / "speech.mp3"
     try:
         communicate = edge_tts.Communicate(text, voice_id, rate=rate, pitch=pitch)
-        await communicate.save(str(mp3_path))
-        data = mp3_path.read_bytes()
+        chunks: list[bytes] = []
+        async for chunk in communicate.stream():
+            if chunk.get("type") == "audio" and chunk.get("data"):
+                chunks.append(chunk["data"])
+        data = b"".join(chunks)
         if not data:
             raise RuntimeError("Edge TTS returned empty audio")
         if bool(voice.get("futuristic_fx", True)):
             data = await asyncio.to_thread(_apply_voice_fx, data)
         return data
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception as exc:
+        print(f"Edge TTS error ({voice_id}): {exc}", flush=True)
+        raise
 
 
-def _mp3_to_pcm16(mp3_path: Path, sample_rate: int = 24000) -> bytes:
-    """Decode an Edge TTS MP3 file to mono signed-16 PCM at sample_rate."""
-    decoded = miniaudio.decode_file(
-        str(mp3_path),
+def _mp3_to_pcm16(mp3_bytes: bytes, sample_rate: int = 24000) -> bytes:
+    """Decodifica un buffer de MP3 en memoria a mono signed-16 PCM a sample_rate."""
+    decoded = miniaudio.decode(
+        mp3_bytes,
         nchannels=1,
         sample_rate=sample_rate,
         output_format=miniaudio.SampleFormat.SIGNED16,
@@ -1098,7 +1193,7 @@ class VoicePipelineServer:
         subject = f"Candidatura: {job_title or 'empleo'} — Jesús González Cala"
         params = urllib.parse.urlencode({"view": "cm", "fs": "1", "to": to_email or "",
                                          "su": subject, "body": body})
-        webbrowser.open("https://mail.google.com/mail/?" + params, new=2)
+        _safe_open_browser("https://mail.google.com/mail/?" + params, new=2)
         if to_email:
             return f"Gmail abierto con el borrador para {to_email}. Revisa y pulsa enviar. Yo no lo mando solo."
         return "Gmail abierto con el borrador en tu nombre. Pon el correo de la empresa y pulsa enviar. Yo no lo mando a ciegas."
@@ -1108,16 +1203,16 @@ class VoicePipelineServer:
         if name == "open_youtube":
             q = (args.get("query") or "").strip()
             if q:
-                webbrowser.open("https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q), new=2)
+                _safe_open_browser("https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q), new=2)
                 return f"Busco {q} en YouTube."
-            webbrowser.open("https://music.youtube.com/", new=2)
+            _safe_open_browser("https://music.youtube.com/", new=2)
             return "Abro YouTube Music."
         if name == "open_browser":
             q = (args.get("url_or_query") or "").strip()
             if q.startswith("http://") or q.startswith("https://"):
-                webbrowser.open(q, new=2)
+                _safe_open_browser(q, new=2)
             else:
-                webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote_plus(q), new=2)
+                _safe_open_browser("https://www.google.com/search?q=" + urllib.parse.quote_plus(q), new=2)
             return "Abierto."
         if name == "open_folder":
             return self._open_named(str(args.get("name") or ""))
@@ -1846,7 +1941,7 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
         )
         readish = bool(re.search(r"revisa|mira|nuev|bandeja|entr[oó]|sin leer|le[ií]do", t))
         if sendish and not readish:
-            webbrowser.open("https://mail.google.com/mail/?view=cm&fs=1", new=2)
+            _safe_open_browser("https://mail.google.com/mail/?view=cm&fs=1", new=2)
             return (
                 "Abro Gmail para escribir. O decime «envíale un correo a X diciendo Y» "
                 "y lo mando yo directo."
@@ -1855,7 +1950,7 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
             r"(?:env[ií]a|manda|escribe)\s+(?:un\s+)?(?:correo|e-?mail|gmail)",
             t,
         ) and not readish:
-            webbrowser.open("https://mail.google.com/mail/?view=cm&fs=1", new=2)
+            _safe_open_browser("https://mail.google.com/mail/?view=cm&fs=1", new=2)
             return (
                 "Abro Gmail para escribir. O decime «envíale un correo a X diciendo Y» "
                 "y lo mando yo directo."
@@ -2210,9 +2305,9 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
             # La página de resultados de búsqueda no se puede embeber (YouTube
             # la bloquea), así que para ese caso raro se abre en el navegador.
             url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query)
-            webbrowser.open(url, new=2)
+            _safe_open_browser(url, new=2)
             return f"Abro YouTube con «{query}». No encontré un vídeo directo; pulsa el que quieras."
-        webbrowser.open("https://music.youtube.com/", new=2)
+        _safe_open_browser("https://music.youtube.com/", new=2)
         return "Abro YouTube Music. ¿Qué canción?"
 
     def _try_youtube_action(self, transcript: str, conversation: str) -> str | None:
@@ -2295,9 +2390,9 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
             return "Vale, dime el título o el nombre de la canción cuando quieras."
         if q:
             url = "https://open.spotify.com/search/" + urllib.parse.quote_plus(q)
-            webbrowser.open(url, new=2)
+            _safe_open_browser(url, new=2)
             return f"Abro Spotify con «{q}». Pulsa play; no tengo credenciales de Spotify para darle yo mismo."
-        webbrowser.open("https://open.spotify.com/", new=2)
+        _safe_open_browser("https://open.spotify.com/", new=2)
         return "Abro Spotify. ¿Qué canción?"
 
     def _try_folder_action(self, transcript: str, conversation: str) -> str | None:
@@ -2396,7 +2491,7 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
         lower = raw.lower()
         url_m = re.search(r"https?://[^\s\)]+", raw, re.I)
         if url_m and re.search(r"\b(abre|abrir|pon|abrelo|ábrelo|ejecuta)\b", lower):
-            webbrowser.open(url_m.group(0), new=2)
+            _safe_open_browser(url_m.group(0), new=2)
             return "Abro el enlace en el navegador."
         return None
 
@@ -2595,23 +2690,28 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
         timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
         record_usage(tts_chars=len(text))
 
-        if str(voice.get("provider") or "") == "xtts":
+        if str(voice.get("provider") or "") == "xtts" and _is_xtts_available():
             timing.tts_model, timing.voice_id = "xtts", "xtts-local"
-            async for chunk in _stream_xtts_pcm(text):
-                if timing.first_tts_audio_byte_monotonic is None:
-                    timing.first_tts_audio_byte_monotonic = time.perf_counter()
-                yield chunk
-            return
+            try:
+                got_any = False
+                async for chunk in _stream_xtts_pcm(text):
+                    got_any = True
+                    if timing.first_tts_audio_byte_monotonic is None:
+                        timing.first_tts_audio_byte_monotonic = time.perf_counter()
+                    yield chunk
+                if got_any:
+                    return
+            except Exception as exc:
+                print(f"[TTS Fallback] XTTS streaming falló ({exc}), fallback inmediato a Edge-TTS...", flush=True)
+                timing.errors.append(f"xtts_stream_fallback: {exc}")
 
-        voice_id = str(voice.get("voice_id") or "es-AR-ElenaNeural")
+        raw_voice_id = str(voice.get("voice_id") or "es-AR-ElenaNeural")
+        voice_id = raw_voice_id if not raw_voice_id.startswith("xtts") else "es-AR-ElenaNeural"
         timing.tts_model = str(voice.get("model") or "edge-tts")
         timing.voice_id = voice_id
-        tmpdir = tempfile.mkdtemp(prefix="jarvis-tts-")
-        mp3_path = Path(tmpdir) / "speech.mp3"
         try:
             mp3 = await synthesize_edge_mp3(text)
-            mp3_path.write_bytes(mp3)
-            pcm = await asyncio.to_thread(_mp3_to_pcm16, mp3_path, sample_rate)
+            pcm = await asyncio.to_thread(_mp3_to_pcm16, mp3, sample_rate)
             if not pcm:
                 print("Edge TTS decoded to empty PCM", flush=True)
                 return
@@ -2623,8 +2723,6 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
         except Exception as exc:
             print(f"Edge TTS failed ({voice_id}): {exc}", flush=True)
             raise
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def _tts_sample_rate(self) -> int:
         fmt = str((self.cfg.get("voice") or {}).get("output_format") or "pcm_24000")
@@ -2766,11 +2864,18 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
     def _read_last_active_provider() -> tuple[str | None, str | None]:
         """Tail latency.jsonl for the most recent turn that actually reached
         an LLM, so a restart doesn't blank the HUD's "currently using" panel."""
-        try:
-            lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
-        except FileNotFoundError:
+        if not LOG_PATH.exists():
             return None, None
-        for line in reversed(lines[-200:]):
+        from collections import deque
+        try:
+            with LOG_PATH.open("r", encoding="utf-8", errors="ignore") as f:
+                last_lines = deque(f, maxlen=200)
+        except Exception:
+            return None, None
+        for line in reversed(last_lines):
+            line = line.strip()
+            if not line:
+                continue
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
@@ -2786,10 +2891,8 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
             self.last_model = timing.llm_model
             self.last_turn_ts = time.time()
         timing.total_done_monotonic = timing.total_done_monotonic or time.perf_counter()
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         summary = timing.summary()
-        with LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+        _append_rotating_jsonl(LOG_PATH, summary)
         print("TURN TIMING", json.dumps(summary, ensure_ascii=False), flush=True)
 
 
@@ -3428,32 +3531,72 @@ _ACTIVITY_LOG_PATH = ROOT / "logs" / "activity_log.jsonl"
 
 def _log_activity(kind: str, detail: dict) -> None:
     """Append-only record of autonomous actions (standing orders, GO-gate
-    decisions). Separate from self-check: this is history, not health."""
+    decisions) with automatic file rotation."""
     row = {"ts": time.time(), "when": datetime.now().isoformat(timespec="seconds"),
            "kind": kind, "detail": detail}
+    _append_rotating_jsonl(_ACTIVITY_LOG_PATH, row)
+
+
+def _read_last_activity_lines(path: Path, limit: int) -> list[dict]:
+    if not path.exists():
+        return []
+    from collections import deque
+    rows: list[dict] = []
     try:
-        _ACTIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _ACTIVITY_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            last_lines = deque(f, maxlen=max(1, min(limit, 500)))
+        for line in last_lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        rows.reverse()
     except Exception as exc:
-        print(f"activity log write failed: {exc}", flush=True)
+        print(f"activity log read failed: {exc}", flush=True)
+    return rows
 
 
 @app.get("/api/activity")
 async def get_activity(limit: int = 50) -> JSONResponse:
     """Last N autonomous-action log entries, newest first."""
-    rows: list[dict] = []
-    try:
-        lines = _ACTIVITY_LOG_PATH.read_text(encoding="utf-8").splitlines()
-        for line in lines[-max(1, min(limit, 500)):]:
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    except FileNotFoundError:
-        pass
-    rows.reverse()
+    rows = await asyncio.to_thread(_read_last_activity_lines, _ACTIVITY_LOG_PATH, limit)
     return JSONResponse({"entries": rows})
+
+
+def _read_gateway_state() -> dict:
+    p = Path.home() / ".hermes" / "gateway_state.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _count_recent_errors(cutoff_ts: float) -> int:
+    err_log = Path.home() / ".hermes" / "logs" / "errors.log"
+    if not err_log.exists():
+        return 0
+    from collections import deque
+    recent = 0
+    try:
+        with err_log.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in deque(f, maxlen=500):
+                m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                if not m or " WARNING " in line:
+                    continue
+                try:
+                    ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+                    if ts >= cutoff_ts:
+                        recent += 1
+                except ValueError:
+                    continue
+    except Exception:
+        pass
+    return recent
 
 
 @app.get("/api/selfcheck")
@@ -3480,7 +3623,7 @@ async def selfcheck() -> JSONResponse:
         checks.append({"name": "gmail_oauth", "ok": False, "detail": str(exc)[:200]})
 
     try:
-        gs = json.loads((Path.home() / ".hermes" / "gateway_state.json").read_text(encoding="utf-8"))
+        gs = await asyncio.to_thread(_read_gateway_state)
         platforms = gs.get("platforms") or {}
         wa = (platforms.get("whatsapp") or {}).get("state")
         checks.append({"name": "whatsapp", "ok": wa == "connected",
@@ -3500,20 +3643,8 @@ async def selfcheck() -> JSONResponse:
         checks.append({"name": "cron_gateway", "ok": False, "detail": str(exc)[:200]})
 
     try:
-        err_log = Path.home() / ".hermes" / "logs" / "errors.log"
         cutoff = time.time() - 900  # last 15 minutes
-        recent = 0
-        if err_log.exists():
-            for line in err_log.read_text(encoding="utf-8", errors="ignore").splitlines()[-500:]:
-                m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
-                if not m or " WARNING " in line:
-                    continue
-                try:
-                    ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
-                except ValueError:
-                    continue
-                if ts >= cutoff:
-                    recent += 1
+        recent = await asyncio.to_thread(_count_recent_errors, cutoff)
         checks.append({"name": "recent_errors", "ok": recent == 0,
                         "detail": f"{recent} error(es) en los últimos 15 min"})
     except Exception as exc:
@@ -3528,16 +3659,12 @@ _WORKER_CACHE: dict = {"ts": 0.0, "data": [], "refreshing": False}
 
 @app.get("/api/machines")
 async def machines() -> JSONResponse:
-    """Local (Mac) stats + configured remote workers.
-
-    Worker polls can take seconds when a worker is offline, so they run in a
-    background refresh; the endpoint always answers instantly from cache.
-    """
+    """Local stats + configured remote workers (non-blocking CPU percent)."""
     result: list[dict] = []
     mac: dict = {"name": "ESTE PC · JARVIS", "online": True}
     if psutil:
         mac.update({
-            "cpu": psutil.cpu_percent(interval=0.1),
+            "cpu": psutil.cpu_percent(interval=None),
             "mem": psutil.virtual_memory().percent,
             "disk": psutil.disk_usage(str(ROOT)).percent,
         })
@@ -3822,12 +3949,21 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         while True:
             message = await ws.receive()
             if "text" in message and message["text"] is not None:
-                event = json.loads(message["text"])
+                try:
+                    event = json.loads(message["text"])
+                except json.JSONDecodeError as jde:
+                    await ws.send_json({"type": "error", "message": f"Malformed JSON: {jde}"})
+                    continue
                 etype = event.get("type")
                 if etype == "start":
+                    try:
+                        ev_start = WSStartEvent.model_validate(event)
+                    except ValidationError as ve:
+                        await ws.send_json({"type": "error", "message": f"Invalid start payload: {ve.errors()}"})
+                        continue
                     await _cancel_active_turn(ws, pipeline, conn)  # barge-in
-                    if event.get("conversation"):
-                        conn.conversation = str(event["conversation"])
+                    if ev_start.conversation:
+                        conn.conversation = ev_start.conversation
                     conn.audio_chunks = []
                     conn.last_partial_bytes = 0
                     conn.recording = True
@@ -3844,13 +3980,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     conn.turn_task = asyncio.create_task(_run_turn(ws, pipeline, conn))
                 elif etype == "stop_run":
                     # PARAR pressed mid-recording (no "stop" sent yet, so no
-                    # turn_task exists for _cancel_active_turn to cancel) —
-                    # without this, conn.recording stayed True forever: the
-                    # server kept silently accumulating audio_chunks from a
-                    # client that had already reset its own UI on the next
-                    # "start", and the client-side mic UI (see stopRun() in
-                    # index.html) had nothing server-side telling it this
-                    # recording was actually abandoned.
+                    # turn_task exists for _cancel_active_turn to cancel)
                     if conn.recording:
                         conn.recording = False
                         conn.audio_chunks = []
@@ -3859,11 +3989,16 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     await _cancel_active_turn(ws, pipeline, conn)
                     await ws.send_json({"type": "agent_status", "state": "stopped"})
                 elif etype == "chat":
-                    text = (event.get("text") or "").strip()
+                    try:
+                        ev_chat = WSChatEvent.model_validate(event)
+                    except ValidationError as ve:
+                        await ws.send_json({"type": "error", "message": f"Invalid chat payload: {ve.errors()}"})
+                        continue
+                    text = ev_chat.text.strip()
                     if text:
                         await _cancel_active_turn(ws, pipeline, conn)
-                        if event.get("conversation"):
-                            conn.conversation = str(event["conversation"])
+                        if ev_chat.conversation:
+                            conn.conversation = ev_chat.conversation
                         conn.audio_chunks = []
                         conn.recording = False
                         conn.timing = TurnTiming(turn_id=pipeline.next_turn_id())
@@ -3871,10 +4006,15 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                         conn.timing.llm_start_monotonic = time.perf_counter()
                         conn.turn_task = asyncio.create_task(_run_text_turn(ws, pipeline, conn, text))
                 elif etype == "approval_decision":
-                    run_id = event.get("run_id") or conn.current_run_id
+                    try:
+                        ev_appr = WSApprovalDecisionEvent.model_validate(event)
+                    except ValidationError as ve:
+                        await ws.send_json({"type": "error", "message": f"Invalid approval payload: {ve.errors()}"})
+                        continue
+                    run_id = ev_appr.run_id or conn.current_run_id
+                    decision = ev_appr.decision
                     if isinstance(run_id, str) and run_id.startswith("standing:"):
                         fut = _STANDING_APPROVALS.get(run_id)
-                        decision = event.get("decision", "deny")
                         if fut and not fut.done():
                             fut.set_result(decision)
                         await ws.send_json({"type": "status", "message": f"Standing order: {decision}."})
@@ -3882,11 +4022,10 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     if not run_id:
                         await ws.send_json({"type": "error", "message": "No run for approval."})
                         continue
-                    decision = event.get("decision", "deny")
                     body = {
                         "decision": decision,
                         "approved": decision == "allow",
-                        "approval_id": event.get("approval_id"),
+                        "approval_id": ev_appr.approval_id,
                     }
                     res = await asyncio.to_thread(pipeline.hermes.post_approval, run_id, body)
                     await ws.send_json({"type": "status", "message": f"Approval sent ({res['status_code']})."})
@@ -3897,10 +4036,12 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     conn.audio_chunks.append(message["bytes"])
                     _maybe_schedule_partial(ws, pipeline, conn)
     except WebSocketDisconnect:
-        if conn.turn_task and not conn.turn_task.done():
-            conn.turn_task.cancel()
         print("Client disconnected", flush=True)
     finally:
+        if conn.partial_task and not conn.partial_task.done():
+            conn.partial_task.cancel()
+        if conn.turn_task and not conn.turn_task.done():
+            conn.turn_task.cancel()
         WS_CLIENTS.discard(ws)
 
 
