@@ -2135,35 +2135,51 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
             return True
 
     def _yt_search_first_id(self, query: str) -> str | None:
-        """Resuelve una búsqueda a un vídeo real de YouTube para poder abrirlo
-        directo — YouTube reproduce solo al entrar a un vídeo por su URL, sin
-        necesitar pulsar nada. Prueba varios candidatos porque algunos vídeos
-        (sobre todo conciertos/contenido oficial completo) tienen la
-        inserción (embed) bloqueada por el dueño y no cargarían en el panel."""
-        try:
-            url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query)
-            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-            ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
-        except Exception:
-            return None
-        seen: list[str] = []
-        for vid in ids:
-            if vid in seen:
-                continue
-            seen.append(vid)
-            if len(seen) > 5:
-                break
+        """Resuelve una búsqueda a un vídeo embeddable de YouTube.
+        Prueba hasta 10 candidatos. Si ninguno permite embed, reintenta
+        añadiendo 'topic' (vídeo oficial/auto-generated) a la búsqueda."""
+        def _search_ids(q: str) -> list[str]:
             try:
-                oe = requests.get(
-                    "https://www.youtube.com/oembed",
-                    params={"url": f"https://www.youtube.com/watch?v={vid}", "format": "json"},
-                    timeout=5,
-                )
-                if oe.ok and self._yt_embeddable(vid):
-                    return vid
+                url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
+                resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+                ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
+                seen: list[str] = []
+                for v in ids:
+                    if v not in seen:
+                        seen.append(v)
+                    if len(seen) >= 10:
+                        break
+                return seen
             except Exception:
-                continue
-        return seen[0] if seen else None
+                return []
+
+        def _first_embeddable(ids: list[str]) -> str | None:
+            for vid in ids:
+                try:
+                    oe = requests.get(
+                        "https://www.youtube.com/oembed",
+                        params={"url": f"https://www.youtube.com/watch?v={vid}", "format": "json"},
+                        timeout=5,
+                    )
+                    if oe.ok and self._yt_embeddable(vid):
+                        return vid
+                except Exception:
+                    continue
+            return None
+
+        # First try: direct query
+        ids = _search_ids(query)
+        vid = _first_embeddable(ids)
+        if vid:
+            return vid
+        # Second try: append "topic" to find auto-generated official uploads (often embeddable)
+        if not query.lower().endswith("topic"):
+            ids2 = _search_ids(query + " topic")
+            vid2 = _first_embeddable(ids2)
+            if vid2:
+                return vid2
+        # Last resort: return first id even if not embeddable (YouTube might show it)
+        return ids[0] if ids else None
 
     def _summon_panel(self, media: str, src: str, title: str) -> bool:
         """Muestra el panel holográfico DENTRO del propio HUD (ya existía en
@@ -2299,7 +2315,8 @@ flag_job_offers: true      # avisar de ofertas de empleo y valorarlas contra tu 
         if not watch and query:
             watch = self._yt_search_first_id(query)
         if watch:
-            self._summon_panel("video", "https://www.youtube.com/watch?v=" + watch, query or "YouTube")
+            embed_url = f"https://www.youtube-nocookie.com/embed/{watch}?autoplay=1&rel=0"
+            self._summon_panel("video", embed_url, query or "YouTube")
             return f"Reproduciendo {query or 'tu vídeo'} en YouTube."
         if query:
             # La página de resultados de búsqueda no se puede embeber (YouTube
@@ -3422,7 +3439,7 @@ async def yt_play(request: Request) -> JSONResponse:
     if not video_id:
         return JSONResponse({"error": f"No encontré ningún vídeo para «{query}»."})
     ok = await asyncio.to_thread(
-        pipe._summon_panel, "video", "https://www.youtube.com/watch?v=" + video_id, query,
+        pipe._summon_panel, "video", f"https://www.youtube-nocookie.com/embed/{video_id}?autoplay=1&rel=0", query,
     )
     if not ok:
         return JSONResponse({"error": "No pude mostrar el panel en el HUD."})

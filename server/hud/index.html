@@ -1698,8 +1698,11 @@ function holoBootTicker(el){
     setTimeout(()=>el.remove(),700)},1000);
 }
 function embedURL(src){
+  // Already a proper embed URL → pass through
+  if(/youtube(?:-nocookie)?\.com\/embed\//.test(src)) return src;
+  // watch/shorts → convert to embed
   const yt=src.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([\w-]{6,})/);
-  if(yt) return `https://www.youtube.com/embed/${yt[1]}?autoplay=1`;
+  if(yt) return `https://www.youtube-nocookie.com/embed/${yt[1]}?autoplay=1&rel=0`;
   return src;
 }
 let lastSummon={key:"",t:0};
@@ -1716,9 +1719,9 @@ function summonPanel(opts){
   let inner="";
   const esrc=encodeURI(src);
   if(media==="image") inner=`<img class="holoContent" src="${esrc}" alt="">`;
-  else if(media==="video" && !/youtube|youtu\.be/.test(src))
+  else if(media==="video" && !/youtube(?:-nocookie)?|youtu\.be/.test(src))
     inner=`<video class="holoContent" src="${esrc}" controls autoplay playsinline></video>`;
-  else inner=`<iframe class="holoContent" src="${embedURL(src)}" allow="autoplay; fullscreen; encrypted-media"></iframe>`;
+  else inner=`<iframe class="holoContent" src="${embedURL(src)}" allow="autoplay; fullscreen; encrypted-media" allowfullscreen></iframe>`;
   p.innerHTML=`
     <svg class="holoFrame" preserveAspectRatio="none" viewBox="0 0 100 100">
       <rect x="0.5" y="0.5" width="99" height="99" pathLength="100" vector-effect="non-scaling-stroke"/>
