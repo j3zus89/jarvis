@@ -555,6 +555,7 @@ let ws=null, wsReady=false, capturing=false, state="standby";
 let audioCtx=null, workletNode=null, mediaStream=null, srcNode=null;
 let playhead=0, activeSources=[], leftoverByte=null, audioArrived=false, ttsRate=24000;
 let level=0, turns=0, voiceTurn=false, heardSpeech=false, quietChunks=0, listenResumeTimer=null;
+let pendingChatEcho=false; // set true when we send typed chat via WS to suppress the server's transcript echo
 let prevLevel=0, clapTimes=[], lastClapWake=0;
 // ponytail: amplitude-transient heuristic, not a trained clap classifier —
 // a sharp door slam or a book dropped near the mic can false-trigger. Good
@@ -758,6 +759,7 @@ function setState(st,label,hint){
     }
   }else if(thinkingTimer){
     clearInterval(thinkingTimer); thinkingTimer=null;
+    $("stateHint").textContent="";  // clear PENSANDO... / SIGUE VIVO when done thinking
   }
 }
 
@@ -840,7 +842,7 @@ function connect(){
     else if(e.type==="dismiss_panels"){ dismissAllPanels(); }
     else if(e.type==="tts_format"){ if(e.sample_rate) ttsRate=e.sample_rate; }
     else if(e.type==="partial_transcript"){ showLive(e.text); }
-    else if(e.type==="transcript"){ clearLive(); if(e.text)addMsg("you",e.text); }
+    else if(e.type==="transcript"){ clearLive(); if(e.text && !pendingChatEcho)addMsg("you",e.text); pendingChatEcho=false; }
     else if(e.type==="announce"){ if(e.text){ addMsg("jarvis",e.text); speakElena(e.text); } }
     else if(e.type==="run_started"){ currentRun=e.run_id; showStop(true); }
     else if(e.type==="approval_request"){ showApproval(e); }
@@ -1037,6 +1039,7 @@ async function greetOnce(){
   await speakElena(line);
 }
 addEventListener("pointerdown", ()=>{ ensureCtx(); }, {capture:true});
+addEventListener("pointerdown", ()=>{ greetOnce(); }, {once:true, capture:true});
 
 /* ====================== humanoid contour view (FASE 5v3) =============== */
 // Reference: a face traced by dense horizontal contour lines that actually
@@ -1307,11 +1310,13 @@ function toggleHumanoid(on){
   const f=$("humanoidFrame");
   if(on){
     if(f && !f.getAttribute("src")) f.setAttribute("src","/hud/humanoid3d/index.html");
+    if(f && f.contentWindow && f.contentWindow.jarvisResume) f.contentWindow.jarvisResume();
     el.classList.add("on");
     requestAnimationFrame(()=>el.classList.add("show"));
     if(!humanoidAmpRAF) humanoidAmpRAF=requestAnimationFrame(humanoidAmpLoop);
     humanoidPushState(state);
   }else{
+    if(f && f.contentWindow && f.contentWindow.jarvisPause) f.contentWindow.jarvisPause();
     el.classList.remove("show");
     setTimeout(()=>{ el.classList.remove("on"); },900);
   }
@@ -1495,6 +1500,8 @@ async function sendChat(){
     setTimeout(()=>{feed.innerHTML="";addMsg("sys","conversación reiniciada");},800);
   }
   if(wsReady){
+    await ensureCtx();   // activate AudioContext NOW with user gesture so audio plays when chunks arrive
+    pendingChatEcho=true;
     ws.send(JSON.stringify({type:"chat", text:payload, conversation:CONV}));
     return;
   }
@@ -1721,7 +1728,8 @@ function holoBootTicker(el){
     (Math.random()*90).toFixed(4)+"N "+(Math.random()*180).toFixed(4)+"W");
   el.innerHTML=lines().join("<br>");
   const iv=setInterval(()=>{el.innerHTML=lines().join("<br>")},65);
-  setTimeout(()=>{clearInterval(iv); el.style.opacity="0";
+  el._tickerIv = iv;
+  setTimeout(()=>{clearInterval(iv); el._tickerIv=null; el.style.opacity="0";
     setTimeout(()=>el.remove(),700)},1000);
 }
 function embedURL(src){
@@ -1769,7 +1777,10 @@ function summonPanel(opts){
   holoBootTicker(p.querySelector(".holoBoot"));
   p.addEventListener("animationend",e=>{
     if(e.animationName==="holoApproach") p.classList.add("idle");
-    if(e.animationName==="holoDismiss") p.remove();
+    if(e.animationName==="holoDismiss") {
+      p.querySelectorAll(".holoBoot").forEach(b=>{if(b._tickerIv)clearInterval(b._tickerIv)});
+      p.remove();
+    }
   });
   p.querySelector(".hx").onclick=()=>dismissPanel(p);
   addActivity("hologram: "+title.toLowerCase());
@@ -1777,10 +1788,14 @@ function summonPanel(opts){
 }
 function dismissPanel(p){
   if(!p||p.classList.contains("dismiss"))return;
+  p.querySelectorAll(".holoBoot").forEach(b=>{if(b._tickerIv)clearInterval(b._tickerIv)});
   p.classList.remove("idle");
   holoWhoosh(false);
   p.classList.add("dismiss");
-  setTimeout(()=>p.remove(),700);  // safety net if animationend is missed
+  setTimeout(()=>{
+    p.querySelectorAll(".holoBoot").forEach(b=>{if(b._tickerIv)clearInterval(b._tickerIv)});
+    p.remove();
+  },700);  // safety net if animationend is missed
 }
 function dismissAllPanels(){document.querySelectorAll(".holo").forEach(dismissPanel)}
 window.summonPanel=summonPanel; window.dismissAllPanels=dismissAllPanels;
