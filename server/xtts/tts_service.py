@@ -23,12 +23,22 @@ Usage: server/xtts/.venv/Scripts/python.exe tts_service.py
 Listens on 127.0.0.1:8790 (loopback only, same as every other internal
 service in this project -- server.py is the only caller).
 """
+import io
 import os
-import tempfile
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 import torch
+
+# DirectML compatibility: disable inference_mode so DML doesn't fail on version_counter
+torch.inference_mode = torch.no_grad
+
+try:
+    import torch_directml
+    _dml_available = True
+except ImportError:
+    _dml_available = False
 
 os.environ.setdefault("COQUI_TOS_AGREED", "1")  # already agreed once interactively; see docs
 
@@ -42,15 +52,15 @@ PORT = 8790
 
 # XTTS-v2 samples stochastically by default (do_sample=True in Xtts.inference)
 # -- the exact same text/reference/params sounds noticeably different on
-# every call otherwise (found live: the same sentence went from 7.3s to 9.2s
-# between two "identical" generations). Reset before every request so the
-# same text always comes out the same way -- no more gambling per sentence.
+# every call otherwise. Reset before every request so the same text always
+# comes out the same way.
 SEED = 2024  # elegida por el usuario entre 5 candidatas, 2026-09-07
 
 app = FastAPI()
 _tts = None  # loaded once, on startup
 _gpt_cond_latent = None  # reference-audio conditioning, computed once (not per request)
 _speaker_embedding = None
+_device = "cpu"
 
 
 class TTSRequest(BaseModel):
@@ -59,21 +69,39 @@ class TTSRequest(BaseModel):
 
 @app.on_event("startup")
 def _load_model() -> None:
-    global _tts, _gpt_cond_latent, _speaker_embedding
+    global _tts, _gpt_cond_latent, _speaker_embedding, _device
     from TTS.api import TTS
     torch.set_num_threads(6)
-    print("Cargando XTTS-v2 (optimizado para Ryzen 6 cores fijos para evitar saturación de CPU)...", flush=True)
-    _tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
+    print("Iniciando XTTS-v2...", flush=True)
+    _tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+
     print("Calculando condicionamiento de la voz de referencia...", flush=True)
-    _gpt_cond_latent, _speaker_embedding = _tts.synthesizer.tts_model.get_conditioning_latents(
+    model = _tts.synthesizer.tts_model
+    _gpt_cond_latent, _speaker_embedding = model.get_conditioning_latents(
         audio_path=str(REFERENCE_WAV),
     )
-    print("XTTS-v2 listo.", flush=True)
+
+    if _dml_available:
+        try:
+            dml = torch_directml.device()
+            print(f"Acelerando XTTS-v2 en GPU AMD Radeon ({dml})...", flush=True)
+            _tts.to(dml)
+            _gpt_cond_latent = _gpt_cond_latent.to(dml)
+            _speaker_embedding = _speaker_embedding.to(dml)
+            _device = str(dml)
+            print("XTTS-v2 listo en GPU DirectML.", flush=True)
+            return
+        except Exception as e:
+            print(f"Error cargando en DirectML ({e}), usando fallback CPU...", flush=True)
+
+    _tts.to("cpu")
+    _device = "cpu"
+    print("XTTS-v2 listo en CPU.", flush=True)
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": _tts is not None}
+    return {"ok": _tts is not None, "device": _device}
 
 
 @app.post("/tts")
@@ -84,11 +112,23 @@ def synthesize(req: TTSRequest) -> Response:
     if not text:
         return JSONResponse({"error": "texto vacío"}, status_code=400)
     torch.manual_seed(SEED)
-    with tempfile.TemporaryDirectory(prefix="xtts-") as tmpdir:
-        out_path = Path(tmpdir) / "out.wav"
-        _tts.tts_to_file(text=text, speaker_wav=str(REFERENCE_WAV), language="es", file_path=str(out_path))
-        data = out_path.read_bytes()
-    return Response(content=data, media_type="audio/wav")
+    try:
+        with torch.no_grad():
+            model = _tts.synthesizer.tts_model
+            out = model.inference(
+                text=text,
+                language="es",
+                gpt_cond_latent=_gpt_cond_latent,
+                speaker_embedding=_speaker_embedding,
+            )
+            wav = out["wav"]
+            bio = io.BytesIO()
+            sf.write(bio, wav, 24000, format="WAV")
+            data = bio.getvalue()
+        return Response(content=data, media_type="audio/wav")
+    except Exception as exc:
+        print(f"Error en /tts: {exc}", flush=True)
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.post("/tts_stream")
@@ -101,14 +141,16 @@ def synthesize_stream(req: TTSRequest):
 
     def gen():
         torch.manual_seed(SEED)
-        model = _tts.synthesizer.tts_model
-        for chunk in model.inference_stream(text, "es", _gpt_cond_latent, _speaker_embedding):
-            pcm16 = (chunk.squeeze().detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
-            if pcm16:
-                yield pcm16
+        with torch.no_grad():
+            model = _tts.synthesizer.tts_model
+            for chunk in model.inference_stream(text, "es", _gpt_cond_latent, _speaker_embedding):
+                pcm16 = (chunk.squeeze().detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
+                if pcm16:
+                    yield pcm16
 
     return StreamingResponse(gen(), media_type="application/octet-stream")
 
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=PORT)
+

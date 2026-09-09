@@ -852,6 +852,7 @@ function connect(){
     }
     else if(e.type==="error"){ clearLive(); addMsg("sys","error: "+e.message); setState("standby","EN ESPERA"); showStop(false); }
     else if(e.type==="done"){
+      flushAudioQueue();
       currentRun=null; showStop(false);
       const tm=e.timing||{};
       turns++; setNumber($("mTurns"),turns);
@@ -864,7 +865,7 @@ function connect(){
       setTimeout(()=>{if(state!=="listening")setState("standby","EN ESPERA")},400);
       if(keepVoice){
         const waitIdle=()=>{
-          if(activeSources.length){ listenResumeTimer=setTimeout(waitIdle,300); return; }
+          if(activeSources.length || audioQueue.length){ listenResumeTimer=setTimeout(waitIdle,300); return; }
           listenResumeTimer=setTimeout(()=>{ if(!capturing && voiceTurn && wsReady) toggleTalk(); }, 600);
         };
         listenResumeTimer=setTimeout(waitIdle,500);
@@ -893,6 +894,33 @@ function getTtsAnalyser(){
   }
   return ttsAnalyser;
 }
+let audioQueue=[];
+let queueDuration=0;
+let isPlayingQueue=false;
+let prerollTimer=null;
+const JITTER_BUFFER_SEC=0.35;
+
+function flushAudioQueue(){
+  if(prerollTimer){ clearTimeout(prerollTimer); prerollTimer=null; }
+  if(!audioCtx || !audioQueue.length) return;
+  const now=audioCtx.currentTime;
+  let start=(playhead > now + 0.010) ? playhead : (now + 0.035);
+  while(audioQueue.length){
+    const ab=audioQueue.shift();
+    const src=audioCtx.createBufferSource();
+    src.buffer=ab;
+    src.connect(getTtsAnalyser()||audioCtx.destination);
+    src.start(start);
+    activeSources.push(src);
+    src.onended=()=>{ activeSources=activeSources.filter(x=>x!==src); if(!activeSources.length) isPlayingQueue=false; };
+    start += ab.duration;
+  }
+  playhead=start;
+  queueDuration=0;
+  isPlayingQueue=true;
+  audioArrived=true;
+}
+
 function playChunk(buf){
   if(!audioCtx){
     try{ audioCtx=new (window.AudioContext||window.webkitAudioContext)(); }catch{return}
@@ -906,14 +934,38 @@ function playChunk(buf){
   const f32=new Float32Array(i16.length);
   for(let i=0;i<i16.length;i++)f32[i]=i16[i]/32768;
   const ab=audioCtx.createBuffer(1,f32.length,ttsRate||24000); ab.copyToChannel(f32,0);
-  const src=audioCtx.createBufferSource(); src.buffer=ab; src.connect(getTtsAnalyser()||audioCtx.destination);
+
   const now=audioCtx.currentTime;
-  const start=(playhead > now + 0.005) ? playhead : (now + 0.015);
-  src.start(start); playhead=start+ab.duration;
-  activeSources.push(src); src.onended=()=>{activeSources=activeSources.filter(x=>x!==src)};
-  audioArrived=true;
+  if(isPlayingQueue && playhead > now + 0.050){
+    const src=audioCtx.createBufferSource();
+    src.buffer=ab;
+    src.connect(getTtsAnalyser()||audioCtx.destination);
+    src.start(playhead);
+    playhead += ab.duration;
+    activeSources.push(src);
+    src.onended=()=>{ activeSources=activeSources.filter(x=>x!==src); if(!activeSources.length) isPlayingQueue=false; };
+    audioArrived=true;
+    return;
+  }
+
+  audioQueue.push(ab);
+  queueDuration += ab.duration;
+  if(queueDuration >= JITTER_BUFFER_SEC || audioQueue.length >= 2){
+    flushAudioQueue();
+  } else if(!prerollTimer){
+    prerollTimer=setTimeout(flushAudioQueue, 200);
+  }
 }
-function stopPlayback(){ activeSources.forEach(s=>{try{s.stop()}catch{}}); activeSources=[]; playhead=0; stopSpeakAudio(); }
+function stopPlayback(){
+  if(prerollTimer){ clearTimeout(prerollTimer); prerollTimer=null; }
+  audioQueue=[];
+  queueDuration=0;
+  isPlayingQueue=false;
+  activeSources.forEach(s=>{try{s.stop()}catch{}});
+  activeSources=[];
+  playhead=0;
+  stopSpeakAudio();
+}
 
 let greeted=false;
 let speakAudio=null;
